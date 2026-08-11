@@ -1,0 +1,44 @@
+import "go:encoding/json"
+import "go:errors"
+import "go:io"
+import "go:strings"
+
+#[json(snake_case)]
+struct StackPRJSON { number: int, merged_at: Option<string> }
+
+#[json(snake_case)]
+struct StackResponse { number: int, pull_requests: Slice<StackPRJSON> }
+
+#[json(snake_case)]
+fn decode_stream<T>(input: string, initial: T) -> Result<Slice<T>, error> {
+  let decoder = input
+    |> strings.NewReader()
+    |> json.NewDecoder()
+  let mut values: Slice<T> = []
+  loop {
+    let mut value = initial
+    match decoder.Decode(&value) {
+      Ok(_) => values = values.append(value),
+      Err(err) => {
+        if errors.Is(err, io.EOF) { return Ok(values) }
+        return Err(err)
+      },
+    }
+  }
+}
+
+fn decode_string(input: string) -> Result<string, error> {
+  let mut value = ""
+  json.Unmarshal(input as Slice<byte>, &value)?
+  Ok(value)
+}
+
+fn parse_stack_resource(input: string) -> Result<StackResource, error> {
+  let mut value = StackResponse { number: 0, pull_requests: [] }
+  json.Unmarshal(input as Slice<byte>, &value)?
+  let pull_requests = value.pull_requests.map(|pr| StackPR {
+    number: pr.number,
+    merged: pr.merged_at.is_some(),
+  })
+  Ok(StackResource { number: value.number, pull_requests })
+}

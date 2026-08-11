@@ -1,0 +1,27 @@
+struct Args { values: Slice<string> }
+
+impl Args {
+  fn new(values: Slice<string>) -> Args {
+    Args { values }
+  }
+
+  fn arg(self, value: string) -> Args {
+    Args { values: self.values.append(value) }
+  }
+
+  fn args(self, values: Slice<string>) -> Args {
+    Args { values: self.values.append(values...) }
+  }
+
+  fn option(self, name: string, value: string) -> Args {
+    self.args([name, value])
+  }
+
+  fn when(self, condition: bool, values: Slice<string>) -> Args {
+    if condition { self.args(values) } else { self }
+  }
+
+  fn build(self) -> Slice<string> {
+    self.values
+  }
+}

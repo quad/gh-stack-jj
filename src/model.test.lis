@@ -1,0 +1,110 @@
+#[test]
+fn planner_examples() {
+  let stack = StackResource {
+    number: 7,
+    pull_requests: [
+      StackPR { number: 11, merged: true },
+      StackPR { number: 12, merged: false },
+    ],
+  }
+  let assert Plan.Noop = stack.plan([12])
+  let assert Plan.Append(delta) = StackResource {
+      number: 7,
+      pull_requests: [StackPR { number: 11, merged: false }],
+    }.plan(
+    [11, 12],
+  )
+  assert delta.equals([12])
+  let assert Plan.Restack(removed) = StackResource {
+      number: 7,
+      pull_requests: [StackPR { number: 11, merged: false }],
+    }.plan(
+    [12, 11],
+  )
+  assert removed.is_empty()
+}
+
+#[test]
+fn planner_restarts_when_a_merged_pr_moves() {
+  let stack = StackResource {
+    number: 7,
+    pull_requests: [
+      StackPR { number: 11, merged: true },
+      StackPR { number: 12, merged: false },
+    ],
+  }
+  let assert Plan.Restack(removed) = stack.plan([13, 11, 12])
+  assert removed.is_empty()
+}
+
+#[test]
+fn planner_properties_are_idempotent_and_classify_relationships() {
+  for i in 1..100 {
+    let active = StackResource {
+      number: 7,
+      pull_requests: [
+        StackPR { number: i, merged: false },
+        StackPR { number: i + 1, merged: false },
+      ],
+    }
+
+    let append_desired = [i, i + 1, i + 2]
+    let assert Plan.Append(delta) = active.plan(append_desired)
+    assert delta.equals([i + 2])
+    let append_after = StackResource {
+      number: 7,
+      pull_requests: [
+        StackPR { number: i, merged: false },
+        StackPR { number: i + 1, merged: false },
+        StackPR { number: i + 2, merged: false },
+      ],
+    }
+    let assert Plan.Noop = append_after.plan(append_desired)
+
+    let lower_desired = [i]
+    let assert Plan.Restack(removed) = active.plan(lower_desired)
+    assert removed.equals([i + 1])
+
+    let restack_desired = [i + 2, i, i + 1]
+    let assert Plan.Restack(removed) = active.plan(restack_desired)
+    assert removed.is_empty()
+    let restack_after = StackResource {
+      number: 7,
+      pull_requests: restack_desired.map(|number| StackPR {
+        number,
+        merged: false,
+      }),
+    }
+    let assert Plan.Noop = restack_after.plan(restack_desired)
+
+    let dropped_desired = [i + 2]
+    let assert Plan.Restack(removed) = active.plan(dropped_desired)
+    assert removed.equals([i, i + 1])
+  }
+}
+
+#[test]
+fn planner_reports_dropped_open_prs() {
+  let stack = StackResource {
+    number: 7,
+    pull_requests: [
+      StackPR { number: 11, merged: false },
+      StackPR { number: 12, merged: false },
+    ],
+  }
+  let assert Plan.Restack(removed) = stack.plan([11])
+  assert removed.equals([12])
+}
+
+#[test]
+fn planner_appends_after_merged_prefix() {
+  let stack = StackResource {
+    number: 7,
+    pull_requests: [
+      StackPR { number: 11, merged: true },
+      StackPR { number: 12, merged: false },
+    ],
+  }
+  let assert Plan.Append(delta) = stack.plan([12, 13])
+  assert delta.equals([13])
+}

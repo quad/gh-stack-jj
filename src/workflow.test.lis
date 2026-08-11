@@ -1,0 +1,558 @@
+import "go:context"
+import "go:strings"
+
+#[test]
+fn workflow_creates_chained_pull_requests_and_stack() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "\"https://github.com/example/repo\"",
+      "[{\"name\":\"feature\",\"remote\":\"\"}]",
+      "\"tip-sha\"",
+      "[{\"name\":\"main\",\"remote\":\"origin\"}]",
+      "\"base-sha\"",
+      "{\"id\":\"one-sha\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer-a\",\"remote\":\"origin\"}],\"is_head\":false,\"title\":\"second commit\"}{\"id\":\"two-sha\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer-b\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"fourth commit\"}",
+      "[]",
+      "[]",
+      "created",
+      "[{\"number\":11,\"baseRefName\":\"main\",\"headRefName\":\"layer-a\",\"state\":\"OPEN\",\"url\":\"https://example.test/11\"}]",
+      "created",
+      "[{\"number\":12,\"baseRefName\":\"layer-a\",\"headRefName\":\"layer-b\",\"state\":\"OPEN\",\"url\":\"https://example.test/12\"}]",
+      "{\"number\":99}",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  run_workflow(config, context.Background())?
+  assert has_call(
+    runner,
+    "gh pr create --base main --head layer-a --title second commit --body ",
+  )
+  assert has_call(
+    runner,
+    "gh pr create --base layer-a --head layer-b --title fourth commit --body ",
+  )
+  assert has_call(
+    runner,
+    "gh api repos/example/repo/stacks --method POST --field pull_requests[]=11 --field pull_requests[]=12",
+  )
+  assert !has_call(runner, "git push")
+  Ok(())
+}
+
+#[test]
+fn workflow_dry_run_does_not_query_or_change_github() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "\"https://github.com/example/repo\"",
+      "[{\"name\":\"feature\",\"remote\":\"\"}]",
+      "\"tip-sha\"",
+      "[{\"name\":\"main\",\"remote\":\"origin\"}]",
+      "\"base-sha\"",
+      "{\"id\":\"one-sha\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer-a\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"change\"}",
+    ],
+    ..,
+  }
+  let config = Config { dry_run: true, ..fake_config(&runner) }
+  run_workflow(config, context.Background())?
+  assert runner.calls.all(|call| !strings.HasPrefix(call, "gh "))
+  Ok(())
+}
+
+#[test]
+fn workflow_rejects_local_bookmarks_that_are_not_pushed() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "\"https://github.com/example/repo\"",
+      "[{\"name\":\"feature\",\"remote\":\"\"}]",
+      "\"tip-sha\"",
+      "[{\"name\":\"main\",\"remote\":\"origin\"}]",
+      "\"base-sha\"",
+      "{\"id\":\"one-sha\",\"local_bookmarks\":[{\"name\":\"not-pushed\",\"remote\":\"\"}],\"remote_bookmarks\":[],\"title\":\"change\"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = run_workflow(fake_config(&runner), context.Background())
+  assert strings.Contains(err.Error(), "bookmarks not pushed to origin")
+  assert strings.Contains(err.Error(), "not-pushed")
+  assert runner.calls.all(|call| !strings.HasPrefix(call, "gh "))
+  Ok(())
+}
+
+#[test]
+fn workflow_updates_existing_open_pull_request_base() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "\"https://github.com/example/repo\"",
+      "[{\"name\":\"feature\",\"remote\":\"\"}]",
+      "\"tip-sha\"",
+      "[{\"name\":\"main\",\"remote\":\"origin\"}]",
+      "\"base-sha\"",
+      "{\"id\":\"one-sha\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer-a\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"change\"}",
+      "[{\"number\":42,\"baseRefName\":\"wrong-base\",\"headRefName\":\"layer-a\",\"state\":\"OPEN\",\"url\":\"https://example.test/42\"}]",
+      "{}",
+      "",
+      "",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  run_workflow(config, context.Background())?
+  assert has_call(runner, "gh pr edit 42 --base main")
+  assert !has_call(runner, "gh pr create")
+  Ok(())
+}
+
+#[test]
+fn sync_stack_extends_matching_prefix() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  sync_stack(config, context.Background(), "main", [
+    PullRequest {
+      number: 11,
+      base_ref_name: "main",
+      head_ref_name: "lower",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+    PullRequest {
+      number: 12,
+      base_ref_name: "lower",
+      head_ref_name: "middle",
+      state: "OPEN",
+      ..,
+    },
+    PullRequest {
+      number: 13,
+      base_ref_name: "middle",
+      head_ref_name: "upper",
+      state: "OPEN",
+      ..,
+    },
+  ])?
+  assert has_call(
+    runner,
+    "repos/example/repo/stacks/7/add --method POST --field pull_requests[]=12 --field pull_requests[]=13",
+  )
+  Ok(())
+}
+
+#[test]
+fn sync_stack_rejects_inconsistent_membership() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: ["{\"number\":7,\"pull_requests\":[]}"],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let assert Err(err) = sync_stack(config, context.Background(), "main", [
+    PullRequest {
+      number: 11,
+      base_ref_name: "main",
+      head_ref_name: "lower",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+    PullRequest {
+      number: 12,
+      base_ref_name: "lower",
+      head_ref_name: "upper",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+  ])
+  assert strings.Contains(err.Error(), "Stack #7 is inconsistent")
+  assert strings.Contains(err.Error(), "#11, #12")
+  assert !has_call(runner, "--method POST")
+  Ok(())
+}
+
+#[test]
+fn sync_stack_ignores_merged_lower_pull_request() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":\"2026-08-10T00:00:00Z\"},{\"number\":12,\"merged_at\":null},{\"number\":13,\"merged_at\":null}]}",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  sync_stack(config, context.Background(), "main", [
+    PullRequest {
+      number: 12,
+      base_ref_name: "main",
+      head_ref_name: "lower",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+    PullRequest {
+      number: 13,
+      base_ref_name: "lower",
+      head_ref_name: "upper",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+  ])?
+  assert !has_call(runner, "--method POST")
+  Ok(())
+}
+
+#[test]
+fn sync_stack_unstacks_for_missing_lower_pull_request() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "",
+      "{\"number\":8}",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  sync_stack(config, context.Background(), "main", [
+    PullRequest {
+      number: 99,
+      base_ref_name: "main",
+      head_ref_name: "missing",
+      state: "OPEN",
+      ..,
+    },
+    PullRequest {
+      number: 11,
+      base_ref_name: "missing",
+      head_ref_name: "top",
+      state: "OPEN",
+      stack: Some(7),
+      ..,
+    },
+  ])?
+  assert has_call(runner, "repos/example/repo/stacks/7/unstack --method POST")
+  assert has_call(runner, "gh api repos/example/repo/stacks --method POST")
+  Ok(())
+}
+
+#[test]
+fn sync_stack_recreates_stack_when_merged_layer_moves() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"number\":3139,\"pull_requests\":[{\"number\":3137,\"merged_at\":null},{\"number\":3138,\"merged_at\":\"2026-08-13T00:00:00Z\"},{\"number\":3080,\"merged_at\":null}]}",
+      "",
+      "{\"number\":3140}",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  sync_stack(config, context.Background(), "main", [
+    PullRequest {
+      number: 3138,
+      base_ref_name: "main",
+      head_ref_name: "layer-3138",
+      stack: Some(3139),
+      state: "CLOSED",
+      merged_at: Some("2026-08-13T00:00:00Z"),
+      ..,
+    },
+    PullRequest {
+      number: 3137,
+      base_ref_name: "layer-3138",
+      head_ref_name: "layer-3137",
+      stack: Some(3139),
+      state: "OPEN",
+      ..,
+    },
+    PullRequest {
+      number: 3080,
+      base_ref_name: "layer-3137",
+      head_ref_name: "layer-3080",
+      stack: Some(3139),
+      state: "OPEN",
+      ..,
+    },
+  ])?
+  assert has_call(
+    runner,
+    "repos/example/repo/stacks/3139/unstack --method POST",
+  )
+  assert has_call(
+    runner,
+    "gh api repos/example/repo/stacks --method POST --field pull_requests[]=3138 --field pull_requests[]=3137 --field pull_requests[]=3080",
+  )
+  Ok(())
+}
+
+#[test]
+fn sync_stack_rejects_dropping_open_pull_requests() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null},{\"number\":12,\"merged_at\":null}]}",
+    ],
+    ..,
+  }
+  let assert Err(err) = sync_stack(
+    Config { repo: Repository.new("example/repo"), ..fake_config(&runner) },
+    context.Background(),
+    "main",
+    [
+      PullRequest {
+        number: 11,
+        base_ref_name: "main",
+        head_ref_name: "lower",
+        state: "OPEN",
+        stack: Some(7),
+        ..,
+      },
+      PullRequest {
+        number: 13,
+        base_ref_name: "lower",
+        head_ref_name: "upper",
+        state: "OPEN",
+        ..,
+      },
+    ],
+  )
+  assert strings.Contains(err.Error(), "open PRs not in the current JJ stack")
+  assert !has_call(runner, "unstack")
+  assert !has_call(runner, "--method POST")
+  Ok(())
+}
+
+#[test]
+fn ensure_pull_requests_restructures_for_insertion() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":10,\"baseRefName\":\"main\",\"headRefName\":\"lower\",\"state\":\"OPEN\",\"stack\":7}]",
+      "[{\"number\":11,\"baseRefName\":\"main\",\"headRefName\":\"upper\",\"state\":\"OPEN\",\"stack\":7}]",
+      "{\"number\":7,\"pull_requests\":[{\"number\":10,\"merged_at\":null},{\"number\":11,\"merged_at\":null}]}",
+      "{\"number\":7,\"pull_requests\":[{\"number\":10,\"merged_at\":null},{\"number\":11,\"merged_at\":null}]}",
+      "",
+      "",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let _ = ensure_pull_requests(config, context.Background(), "main", [
+    Layer { head: "lower", title: "lower change" },
+    Layer { head: "upper", title: "upper change" },
+  ])?
+  assert has_call(runner, "repos/example/repo/stacks/7/unstack --method POST")
+  assert has_call(runner, "gh pr edit 11 --base lower")
+  Ok(())
+}
+
+#[test]
+fn ensure_pull_requests_rejects_multiple_stack_ownership_before_mutation() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":10,\"baseRefName\":\"main\",\"headRefName\":\"lower\",\"state\":\"OPEN\",\"stack\":7}]",
+      "[{\"number\":11,\"baseRefName\":\"lower\",\"headRefName\":\"upper\",\"state\":\"OPEN\",\"stack\":8}]",
+    ],
+    ..,
+  }
+  let assert Err(err) = ensure_pull_requests(
+    Config { repo: Repository.new("example/repo"), ..fake_config(&runner) },
+    context.Background(),
+    "main",
+    [
+      Layer { head: "lower", title: "lower change" },
+      Layer { head: "upper", title: "upper change" },
+    ],
+  )
+  assert strings.Contains(err.Error(), "multiple Stacks: #7, #8")
+  assert !has_call(runner, "gh pr create")
+  assert !has_call(runner, "gh pr edit")
+  Ok(())
+}
+
+#[test]
+fn ensure_pull_requests_rejects_inconsistent_stack_before_mutation() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":10,\"baseRefName\":\"main\",\"headRefName\":\"lower\",\"state\":\"OPEN\",\"stack\":7}]",
+      "[{\"number\":11,\"baseRefName\":\"lower\",\"headRefName\":\"upper\",\"state\":\"OPEN\",\"stack\":7}]",
+      "{\"number\":7,\"pull_requests\":[{\"number\":10,\"merged_at\":null}]}",
+    ],
+    ..,
+  }
+  let assert Err(err) = ensure_pull_requests(
+    Config { repo: Repository.new("example/repo"), ..fake_config(&runner) },
+    context.Background(),
+    "main",
+    [
+      Layer { head: "lower", title: "lower change" },
+      Layer { head: "upper", title: "upper change" },
+    ],
+  )
+  assert strings.Contains(err.Error(), "Stack #7 is inconsistent")
+  assert !has_call(runner, "gh pr create")
+  assert !has_call(runner, "gh pr edit")
+  Ok(())
+}
+
+#[test]
+fn base_reconciliation_invalidates_cleared_stack_membership() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":11,\"baseRefName\":\"wrong\",\"headRefName\":\"layer\",\"state\":\"OPEN\",\"stack\":7}]",
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "",
+      "",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let prs = ensure_pull_requests(config, context.Background(), "main", [
+    Layer { head: "layer", title: "change" },
+  ])?
+  assert prs.length() == 1
+  assert prs[0].stack.is_none()
+  Ok(())
+}
+
+#[test]
+fn base_reconciliation_reports_cleared_stack_on_edit_failure() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":11,\"baseRefName\":\"wrong\",\"headRefName\":\"layer\",\"state\":\"OPEN\",\"stack\":7}]",
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "{\"number\":7,\"pull_requests\":[{\"number\":11,\"merged_at\":null}]}",
+      "",
+      "ERR:base update failed",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let assert Err(err) = ensure_pull_requests(
+    config,
+    context.Background(),
+    "main",
+    [Layer { head: "layer", title: "change" }],
+  )
+  assert strings.Contains(err.Error(), "set base of pull request #11 to main")
+  assert strings.Contains(err.Error(), "Stack #7 was cleared")
+  assert strings.Contains(err.Error(), "rerun to finish reconciliation")
+  Ok(())
+}
+
+#[test]
+fn base_edit_failure_without_stack_keeps_operation_context() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":11,\"baseRefName\":\"wrong\",\"headRefName\":\"layer\",\"state\":\"OPEN\"}]",
+      "ERR:base update failed",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let assert Err(err) = ensure_pull_requests(
+    config,
+    context.Background(),
+    "main",
+    [Layer { head: "layer", title: "change" }],
+  )
+  assert strings.Contains(err.Error(), "set base of pull request #11 to main")
+  assert !strings.Contains(err.Error(), "was cleared")
+  Ok(())
+}
+
+#[test]
+fn created_pull_request_lookup_failure_is_recoverable() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["[]", "created", "[]"], .. }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let assert Err(err) = ensure_pull_requests(
+    config,
+    context.Background(),
+    "main",
+    [Layer { head: "layer", title: "change" }],
+  )
+  assert strings.Contains(err.Error(), "creation may have succeeded")
+  assert strings.Contains(err.Error(), "rerun is safe")
+  Ok(())
+}
+
+#[test]
+fn ensure_pull_requests_retains_merged_layers() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":10,\"baseRefName\":\"main\",\"headRefName\":\"merged\",\"state\":\"CLOSED\",\"mergedAt\":\"2026-08-10T00:00:00Z\"}]",
+      "[{\"number\":11,\"baseRefName\":\"wrong\",\"headRefName\":\"open\",\"state\":\"OPEN\"}]",
+      "",
+      "",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let numbers = ensure_pull_requests(config, context.Background(), "main", [
+    Layer { head: "merged", title: "merged change" },
+    Layer { head: "open", title: "open change" },
+  ])?
+  assert numbers.map(|pr| pr.number).equals([10, 11])
+  assert has_call(runner, "gh pr edit 11 --base main")
+  assert !has_call(runner, "--base merged")
+  Ok(())
+}
+
+#[test]
+fn ensure_pull_requests_replaces_merged_pr_with_wrong_base() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":10,\"baseRefName\":\"old-base\",\"headRefName\":\"layer\",\"state\":\"CLOSED\",\"mergedAt\":\"2026-08-10T00:00:00Z\"}]",
+      "created",
+      "[{\"number\":11,\"baseRefName\":\"main\",\"headRefName\":\"layer\",\"state\":\"OPEN\"}]",
+    ],
+    ..,
+  }
+  let config = Config {
+    repo: Repository.new("example/repo"),
+    ..fake_config(&runner),
+  }
+  let prs = ensure_pull_requests(config, context.Background(), "main", [
+    Layer { head: "layer", title: "change" },
+  ])?
+  assert prs.map(|pr| pr.number).equals([11])
+  assert has_call(
+    runner,
+    "gh pr create --base main --head layer --title change --body ",
+  )
+  Ok(())
+}

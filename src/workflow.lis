@@ -1,0 +1,40 @@
+import "go:context"
+import "go:strconv"
+
+fn base_branch(config: Config, ctx: context.Context) -> Result<string, error> {
+  let trunk = trunk_branch(config, ctx).wrap_err("find jj trunk")?
+  if trunk != "" { return Ok(trunk) }
+  default_branch(config, ctx).wrap_err("find GitHub default branch")
+}
+
+fn resolve_target(config: Config, ctx: context.Context) -> Result<Target, error> {
+  let branch = if config.bookmark != "" {
+    config.bookmark
+  } else {
+    current_bookmark(config, ctx).wrap_err("find current jj bookmark")?
+  }
+  let tip = resolve(config, ctx, remote_bookmark_revset(branch, config.remote)).wrap_err(
+    f"resolve pushed bookmark {branch} on {config.remote}",
+  )?
+  let base = base_branch(config, ctx)?
+  let base_commit = resolve(
+      config,
+      ctx,
+      f"coalesce({remote_bookmark_revset(base, config.remote)}, bookmarks(exact:{strconv.Quote(base)}))",
+    ).wrap_err(
+    f"resolve base bookmark {base} on {config.remote} or locally",
+  )?
+  Ok(Target { bookmark: branch, tip, base, base_commit })
+}
+
+fn run_workflow(config: Config, ctx: context.Context) -> Result<(), error> {
+  let repo = remote_repo(config, ctx).wrap_err(
+    f"derive GitHub repository from jj remote '{config.remote}'",
+  )?
+  let config = Config { repo, ..config }
+  let target = resolve_target(config, ctx)?
+  let layers = load_layers(config, ctx, target).wrap_err(
+    f"find pushed bookmarks between {target.base} and {target.bookmark}",
+  )?
+  reconcile_target(config, ctx, target, layers)
+}

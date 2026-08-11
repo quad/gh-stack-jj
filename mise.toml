@@ -1,11 +1,11 @@
 [tools]
-go = "1.26.5"
+lisette = "0.11.2"
 
 [tasks.build]
-description = "Test, vet, and build gh-stack-jj"
+description = "Format, check, test, and build"
 run = [
-  "go fmt ./...",
-  "go test ./...",
-  "go vet ./...",
-  "go build -o gh-stack-jj .",
+  "lis format",
+  "lis check",
+  "lis test",
+  "lis build",
 ]

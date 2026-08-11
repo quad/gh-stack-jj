@@ -1,0 +1,287 @@
+import "go:context"
+import "go:errors"
+import "go:fmt"
+import "go:os"
+import "go:slices"
+
+struct PlannedLayer {
+  layer: Layer,
+  base: string,
+  pull_request: Option<PullRequest>,
+}
+
+struct PendingBaseChange { pull_request: PullRequest, base: string }
+
+fn resolved_pr_url(config: Config, number: int, url: string) -> string {
+  if url == "" { pull_request_url(config, number) } else { url }
+}
+
+fn print_pr(
+  config: Config,
+  number: int,
+  url: string,
+  prefix: string,
+  suffix: string,
+) {
+  let link = resolved_pr_url(config, number, url)
+  fmt.Fprintln(os.Stdout, f"{prefix}PR #{number} {link}{suffix}")
+}
+
+fn write_pr_list(config: Config, numbers: Slice<int>) {
+  for number in numbers {
+    print_pr(config, number, "", "\t", "")
+  }
+}
+
+fn write_stack(config: Config, prs: Slice<PullRequest>, base: string) {
+  for (_, pr) in slices.Backward(prs) {
+    let link = resolved_pr_url(config, pr.number, pr.url)
+    fmt.Fprintln(os.Stdout, f"\tPR #{pr.number} {pr.head_ref_name} {link}")
+  }
+  fmt.Fprintln(os.Stdout, f"\t{base}")
+}
+
+fn discover_pull_requests(
+  config: Config,
+  ctx: context.Context,
+  base: string,
+  layers: Slice<Layer>,
+) -> Result<Slice<PlannedLayer>, error> {
+  let mut parent = base
+  let mut planned: Slice<PlannedLayer> = []
+  for layer in layers {
+    let existing = find_pr(config, ctx, layer.head)?.filter(
+      |pr| pr.is_open() || pr.base_ref_name == parent,
+    )
+    let advances_parent = existing.map_or(true, |pr| pr.is_open())
+    planned = planned.append(
+      PlannedLayer { layer, base: parent, pull_request: existing },
+    )
+    if advances_parent { parent = layer.head }
+  }
+  Ok(planned)
+}
+
+fn load_consistent_stack(
+  config: Config,
+  ctx: context.Context,
+  prs: Slice<PullRequest>,
+) -> Result<Option<StackResource>, error> {
+  let mut memberships: Slice<int> = []
+  let mut claimed_members: Slice<int> = []
+  for pr in prs {
+    let Some(stack) = pr.stack else {
+      continue
+    }
+    claimed_members = claimed_members.append(pr.number)
+    if !memberships.contains(stack) { memberships = memberships.append(stack) }
+  }
+  if memberships.length() > 1 {
+    let stack_numbers = memberships.map(|number| f"#{number}").join(", ")
+    return Err(errors.New(
+      f"pull requests belong to multiple Stacks: {stack_numbers}",
+    ))
+  }
+  if memberships.is_empty() { return Ok(None) }
+  let stack_number = memberships[0]
+  let stack = read_stack(config, ctx, stack_number)?
+  let stack_members = stack.pull_requests.map(|pr| pr.number)
+  let missing = claimed_members
+    .filter(|number| !stack_members.contains(number))
+    .map(|number| f"#{number}")
+  if !missing.is_empty() {
+    let joined = missing.join(", ")
+    return Err(errors.New(
+      f"Stack #{stack_number} is inconsistent: {joined} belongs to it but is absent from the Stack membership response",
+    ))
+  }
+  Ok(Some(stack))
+}
+
+fn validate_pull_request_plan(
+  config: Config,
+  ctx: context.Context,
+  planned: Slice<PlannedLayer>,
+) -> Result<(), error> {
+  let mut prs: Slice<PullRequest> = []
+  for item in planned {
+    let Some(pr) = item.pull_request else {
+      continue
+    }
+    if prs.any(|other| other.number == pr.number) {
+      return Err(fmt.Errorf(
+        "pull request #%d appears more than once in the planned stack",
+        pr.number,
+      ))
+    }
+    prs = prs.append(pr)
+  }
+  let _ = load_consistent_stack(config, ctx, prs)?
+  Ok(())
+}
+
+fn reconcile_base_changes(
+  config: Config,
+  ctx: context.Context,
+  changes: Slice<PendingBaseChange>,
+  submitted_prs: Slice<PullRequest>,
+) -> Result<Slice<PullRequest>, error> {
+  let mut restructured: Slice<int> = []
+  for change in changes {
+    let Some(stack) = change.pull_request.stack else {
+      continue
+    }
+    if restructured.contains(stack) { continue }
+    let stack_data = read_stack(config, ctx, stack)?
+    clear_stack(config, ctx, stack_data.number)?
+    restructured = restructured.append(stack)
+  }
+  let cleared_stacks = restructured.map(|number| f"#{number}").join(", ")
+  for change in changes {
+    let recovery = if cleared_stacks == "" {
+      ""
+    } else {
+      f"; Stack {cleared_stacks} was cleared; rerun to finish reconciliation"
+    }
+    edit_base(config, ctx, change.pull_request.number, change.base).wrap_err(
+      f"set base of pull request #{change.pull_request.number} to {change.base}{recovery}",
+    )?
+    print_pr(
+      config,
+      change.pull_request.number,
+      change.pull_request.url,
+      change.pull_request.head_ref_name + " -> ",
+      f" (base changed to {change.base})",
+    )
+  }
+  Ok(submitted_prs.map(|pr| {
+    let cleared = pr.stack.map_or(false, |stack| restructured.contains(stack))
+    if cleared { PullRequest { stack: None, ..pr } } else { pr }
+  }))
+}
+
+fn apply_pull_requests(
+  config: Config,
+  ctx: context.Context,
+  planned: Slice<PlannedLayer>,
+) -> Result<Slice<PullRequest>, error> {
+  let mut submitted_prs: Slice<PullRequest> = []
+  let mut changes: Slice<PendingBaseChange> = []
+  for item in planned {
+    let pr = if let Some(pr) = item.pull_request {
+      pr
+    } else {
+      create_pr(config, ctx, item.layer.head, item.base, item.layer.title).wrap_err(
+        f"create pull request for {item.layer.head}",
+      )?
+      let Some(pr) = find_pr(config, ctx, item.layer.head).wrap_err(
+        f"find created pull request for {item.layer.head}",
+      )? else {
+        return Err(errors.New(
+          f"read created pull request for {item.layer.head}: GitHub returned no pull request; creation may have succeeded, rerun is safe",
+        ))
+      }
+      print_pr(
+        config,
+        pr.number,
+        pr.url,
+        item.layer.head + " -> ",
+        f" (base {item.base})",
+      )
+      pr
+    }
+    if pr.is_open() && pr.base_ref_name != item.base {
+      changes = changes.append(
+        PendingBaseChange { pull_request: pr, base: item.base },
+      )
+    }
+    submitted_prs = submitted_prs.append(pr)
+  }
+  if changes.is_empty() { return Ok(submitted_prs) }
+  reconcile_base_changes(config, ctx, changes, submitted_prs)
+}
+
+fn ensure_pull_requests(
+  config: Config,
+  ctx: context.Context,
+  base: string,
+  layers: Slice<Layer>,
+) -> Result<Slice<PullRequest>, error> {
+  let planned = discover_pull_requests(config, ctx, base, layers)?
+  validate_pull_request_plan(config, ctx, planned)?
+  apply_pull_requests(config, ctx, planned)
+}
+
+fn write_dry_run(base: string, layers: Slice<Layer>) {
+  let mut parent = base
+  for layer in layers {
+    fmt.Fprintln(os.Stdout, f"\t{layer.head} -> {layer.title} (base {parent})")
+    parent = layer.head
+  }
+}
+
+fn sync_stack(
+  config: Config,
+  ctx: context.Context,
+  base: string,
+  prs: Slice<PullRequest>,
+) -> Result<(), error> {
+  if prs.length() < 2 { return Ok(()) }
+  let numbers = prs.map(|pr| pr.number)
+  let Some(stack) = load_consistent_stack(config, ctx, prs)? else {
+    let stack_number = create_stack(config, ctx, numbers)?
+    fmt.Fprintln(os.Stdout, f"Stack #{stack_number} created with:")
+    write_stack(config, prs, base)
+    return Ok(())
+  }
+  let stack_number = stack.number
+  let plan = stack.plan(numbers)
+  match plan {
+    Plan.Noop => Ok(()),
+    Plan.Append(delta) => {
+      extend_stack(config, ctx, stack_number, delta)?
+      fmt.Fprintln(os.Stdout, f"Stack #{stack_number} extended with:")
+      write_pr_list(config, delta)
+      Ok(())
+    },
+    Plan.Restack(removed) => {
+      let dropped_open = removed
+        .filter(|number| stack.pull_requests.any(
+          |pr| pr.number == number && !pr.merged,
+        ))
+        .map(|number| f"#{number}")
+      if !dropped_open.is_empty() {
+        let joined = dropped_open.join(", ")
+        return Err(errors.New(
+          f"Stack #{stack.number} contains open PRs not in the current JJ stack: {joined}; close them before restacking",
+        ))
+      }
+      clear_stack(config, ctx, stack.number)?
+      let replacement = create_stack(config, ctx, numbers).wrap_err(
+        f"recreate Stack after clearing Stack #{stack.number}",
+      )?
+      fmt.Fprintln(os.Stdout, f"Stack #{replacement} created with:")
+      write_stack(config, prs, base)
+      if !removed.is_empty() {
+        fmt.Fprintln(os.Stdout, "Removed from old Stack:")
+        write_pr_list(config, removed)
+      }
+      Ok(())
+    },
+  }
+}
+
+fn reconcile_target(
+  config: Config,
+  ctx: context.Context,
+  target: Target,
+  layers: Slice<Layer>,
+) -> Result<(), error> {
+  if layers.is_empty() { return Ok(()) }
+  if config.dry_run {
+    write_dry_run(target.base, layers)
+    return Ok(())
+  }
+  let prs = ensure_pull_requests(config, ctx, target.base, layers)?
+  sync_stack(config, ctx, target.base, prs)
+}

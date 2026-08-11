@@ -1,0 +1,67 @@
+import "go:context"
+import "go:strings"
+
+type Runner = fn(context.Context, string, Slice<string>) -> Result<string, error>
+
+struct Repository { name: string, host: string, path: string }
+
+impl Repository {
+  fn new(name: string) -> Repository {
+    let normalized = name |> strings.Trim("/")
+    let parts = normalized |> strings.Split("/")
+    if parts.length() == 3 {
+      return Repository {
+        name: normalized,
+        host: parts[0],
+        path: f"{parts[1]}/{parts[2]}",
+      }
+    }
+    Repository { name: normalized, host: "github.com", path: normalized }
+  }
+}
+
+struct Config {
+  remote: string,
+  bookmark: string,
+  repo: Repository,
+  draft: bool,
+  dry_run: bool,
+  debug: bool,
+  runner: Runner,
+}
+
+struct Target {
+  bookmark: string,
+  tip: string,
+  base: string,
+  base_commit: string,
+}
+
+#[json(snake_case)]
+struct JJBookmark { name: string, remote: string }
+
+#[json(snake_case)]
+struct JJLayer {
+  id: string,
+  local_bookmarks: Slice<JJBookmark>,
+  remote_bookmarks: Slice<JJBookmark>,
+  is_head: bool,
+  title: string,
+}
+
+#[json(camel_case)]
+struct PullRequest {
+  number: int,
+  base_ref_name: string,
+  head_ref_name: string,
+  state: string,
+  merged_at: Option<string>,
+  url: string,
+  stack: Option<int>,
+}
+
+impl PullRequest {
+  fn is_open(self) -> bool {
+    strings.EqualFold(self.state, "open")
+  }
+}

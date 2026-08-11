@@ -1,0 +1,291 @@
+import "go:context"
+import "go:strings"
+
+#[test]
+fn sorts_bookmark_names() {
+  let got = bookmark_names([
+    JJBookmark { name: "main", remote: "origin" },
+    JJBookmark { name: "layer", remote: "origin" },
+    JJBookmark { name: "layer", remote: "origin" },
+  ])
+  assert got.equals(["layer", "layer", "main"])
+}
+
+#[test]
+fn run_jj_adds_deterministic_global_flags() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["ok"], .. }
+  let config = fake_config(&runner)
+  let output = run_jj(config, context.Background(), [
+    "log",
+    "--template",
+    "commit_id",
+  ])?
+  assert output == "ok"
+  assert has_call(
+    runner,
+    "jj --ignore-working-copy --no-pager --color=never --quiet log --template commit_id",
+  )
+  Ok(())
+}
+
+#[test]
+fn builds_remote_bookmark_revset() {
+  let got = remote_bookmark_revset("feature", "origin")
+  assert got == "remote_bookmarks(exact:\"feature\", remote=exact:\"origin\")"
+}
+
+#[test]
+fn resolve_rejects_invalid_json() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["\"one\"\"two\""], .. }
+  let config = fake_config(&runner)
+  let assert Err(err) = resolve(config, context.Background(), "ambiguous")
+  assert strings.Contains(err.Error(), "parse revision ambiguous")
+  Ok(())
+}
+
+#[test]
+fn current_bookmark_rejects_duplicate_names() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"name\":\"feature\",\"remote\":\"\"}][{\"name\":\"feature\",\"remote\":\"\"}]",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  let assert Err(err) = current_bookmark(config, context.Background())
+  assert strings.Contains(err.Error(), "multiple bookmarks")
+  Ok(())
+}
+
+#[test]
+fn trunk_branch_uses_selected_remote() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: ["[{\"name\":\"main\",\"remote\":\"origin\"}]"],
+    ..,
+  }
+  let config = fake_config(&runner)
+  let branch = trunk_branch(config, context.Background())?
+  assert branch == "main"
+  assert has_call(
+    runner,
+    "json(remote_bookmarks.filter(|b| b.remote() == \"origin\"))",
+  )
+  Ok(())
+}
+
+#[test]
+fn remote_repo_parses_github_and_enterprise_urls() -> Result<(), error> {
+  let cases = [
+    ("\"https://github.com/acme/project.git\"", "acme/project"),
+    ("\"https://ghe.example/acme/project.git/\"", "ghe.example/acme/project"),
+  ]
+  for case in cases {
+    let mut runner = FakeRunner { outputs: [case.0], .. }
+    let config = fake_config(&runner)
+    let repo = remote_repo(config, context.Background())?
+    assert repo.name == case.1
+    assert repo.path == "acme/project"
+  }
+  Ok(())
+}
+
+#[test]
+fn layers_trim_titles_and_use_remote_bookmarks() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"commit\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"  title\\twith tab  \"}",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  let values = load_layers(
+    config,
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )?
+  assert values.length() == 1
+  assert values[0].title == "title\twith tab"
+  assert has_call(runner, "remote_bookmarks(remote=exact:\"origin\")")
+  assert has_call(
+    runner,
+    "exactly(fork_point(commit_id(\"base-id\") | commit_id(\"tip-id\")), 1)..commit_id(\"tip-id\")",
+  )
+  assert has_call(runner, "concat('{ \"id\": ', json(commit_id)")
+  assert has_call(runner, "json(self.contained_in(\"heads(")
+  Ok(())
+}
+
+#[test]
+fn layers_reject_missing_description() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"commit\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"  \"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(err.Error(), "bookmark \"layer\" has no description")
+  Ok(())
+}
+
+#[test]
+fn automatic_base_rejects_ambiguous_fork_point() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["ERR:fork point is ambiguous"], .. }
+  let config = fake_config(&runner)
+  let assert Err(err) = load_layers(
+    config,
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(err.Error(), "fork point is ambiguous")
+  assert has_call(
+    runner,
+    "exactly(fork_point(commit_id(\"base-id\") | commit_id(\"tip-id\")), 1)",
+  )
+  Ok(())
+}
+
+#[test]
+fn load_layers_rejects_local_only_bookmarks_before_github_work() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"one\",\"local_bookmarks\":[{\"name\":\"local-b\",\"remote\":\"\"}],\"remote_bookmarks\":[],\"title\":\"first\"}{\"id\":\"two\",\"local_bookmarks\":[{\"name\":\"local-a\",\"remote\":\"\"}],\"remote_bookmarks\":[],\"title\":\"second\"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(
+    err.Error(),
+    "bookmarks not pushed to origin: local-a, local-b",
+  )
+  assert has_call(
+    runner,
+    "(bookmarks() | remote_bookmarks(remote=exact:\"origin\"))",
+  )
+  assert has_call(runner, "bookmarks(exact:\"tip\")")
+  Ok(())
+}
+
+#[test]
+fn load_layers_rejects_malformed_empty_record() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"orphan\",\"local_bookmarks\":[],\"remote_bookmarks\":[],\"title\":\"change\"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(
+    err.Error(),
+    "neither local nor origin remote bookmarks",
+  )
+  Ok(())
+}
+
+#[test]
+fn load_layers_reports_local_only_before_pushed_layer_errors() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"local\",\"local_bookmarks\":[{\"name\":\"missing\",\"remote\":\"\"}],\"remote_bookmarks\":[],\"title\":\"change\"}{\"id\":\"remote\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"layer\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"  \"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(
+    err.Error(),
+    "bookmarks not pushed to origin: missing",
+  )
+  assert !strings.Contains(err.Error(), "no description")
+  Ok(())
+}
+
+#[test]
+fn local_aliases_on_pushed_commit_are_ignored() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"commit\",\"local_bookmarks\":[{\"name\":\"debug\",\"remote\":\"\"}],\"remote_bookmarks\":[{\"name\":\"layer\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"change\"}",
+    ],
+    ..,
+  }
+  let layers = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )?
+  assert layers.map(|layer| layer.head).equals(["layer"])
+  Ok(())
+}
+
+#[test]
+fn load_layers_rejects_non_linear_stack_with_context() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "{\"id\":\"one\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"lower\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"lower\"}{\"id\":\"two\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"upper\",\"remote\":\"origin\"}],\"is_head\":true,\"title\":\"upper\"}",
+    ],
+    ..,
+  }
+  let assert Err(err) = load_layers(
+    fake_config(&runner),
+    context.Background(),
+    Target {
+      bookmark: "tip",
+      tip: "tip-id",
+      base: "main",
+      base_commit: "base-id",
+    },
+  )
+  assert strings.Contains(err.Error(), "check one before two")
+  assert runner.calls.length() == 1
+  Ok(())
+}

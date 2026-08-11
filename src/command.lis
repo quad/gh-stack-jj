@@ -1,0 +1,36 @@
+import "go:context"
+import "go:fmt"
+import "go:os"
+import "go:os/exec"
+import "go:time"
+
+fn exec_command(ctx: context.Context, name: string, args: Slice<string>) -> Result<string, error> {
+  let command = exec.CommandContext(ctx, name, args...)
+  command.Stderr = Some(os.Stderr)
+  Ok(command.Output()? as string)
+}
+
+fn run_command(config: Config, ctx: context.Context, name: string, args: Args) -> Result<string, error> {
+  let values = args.build()
+  if config.debug {
+    let command = values.join(" ")
+    fmt.Fprintln(os.Stderr, f"exec {name} {command}")
+  }
+  let started = time.Now()
+  let output = config.runner(ctx, name, values)
+  if config.debug {
+    fmt.Fprintln(os.Stderr, f"done {name} in {time.Since(started)}")
+  }
+  output.wrap_err(f"run {name}")
+}
+
+fn run_jj(config: Config, ctx: context.Context, args: Slice<string>) -> Result<string, error> {
+  let jj_args = Args
+    .new(["--ignore-working-copy", "--no-pager", "--color=never", "--quiet"])
+    .args(args)
+  run_command(config, ctx, "jj", jj_args)
+}
+
+fn run_gh(config: Config, ctx: context.Context, args: Args) -> Result<string, error> {
+  run_command(config, ctx, "gh", args)
+}

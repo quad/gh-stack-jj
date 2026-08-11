@@ -1,0 +1,41 @@
+import "go:context"
+import "go:errors"
+import "go:flag"
+import "go:fmt"
+import "go:os"
+
+fn main() {
+  let flags = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+  flags.SetOutput(os.Stderr)
+  let remote = flags.String(
+    "remote",
+    "origin",
+    "jj git remote containing the pushed bookmark",
+  )
+  let bookmark = flags.String("bookmark", "", "jj bookmark to stack")
+  let draft = flags.Bool("draft", false, "create pull requests as drafts")
+  let dry_run = flags.Bool("dry-run", false, "show stack updating GitHub")
+  let debug = flags.Bool("debug", false, "log commands")
+  if let Err(err) = flags.Parse(os.Args[1..]) {
+    if errors.Is(err, flag.ErrHelp) { return }
+    fmt.Fprintln(os.Stderr, err)
+    os.Exit(2)
+  }
+  if flags.NArg() != 0 {
+    fmt.Fprintln(os.Stderr, f"unexpected argument {flags.Arg(0)}")
+    os.Exit(2)
+  }
+  let config = Config {
+    remote: remote.*,
+    bookmark: bookmark.*,
+    repo: Repository.new(""),
+    draft: draft.*,
+    dry_run: dry_run.*,
+    debug: debug.*,
+    runner: exec_command,
+  }
+  if let Err(err) = run_workflow(config, context.Background()) {
+    fmt.Fprintln(os.Stderr, err)
+    os.Exit(1)
+  }
+}

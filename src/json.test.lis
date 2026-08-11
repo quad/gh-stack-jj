@@ -1,0 +1,21 @@
+#[test]
+fn decodes_concatenated_jj_layers() -> Result<(), error> {
+  let input = "{\"id\":\"a\",\"local_bookmarks\":[],\"remote_bookmarks\":[{\"name\":\"one\",\"remote\":\"origin\"}],\"title\":\"first\"}{\"id\":\"b\",\"local_bookmarks\":[],\"remote_bookmarks\":[],\"title\":\"second\"}"
+  let layers = decode_layers(input)?
+  assert layers.length() == 2
+  assert layers[0].id == "a"
+  assert layers[0].remote_bookmarks[0].name == "one"
+  assert layers[1].title == "second"
+  Ok(())
+}
+
+#[test]
+fn parses_stack_responses() -> Result<(), error> {
+  let stack = parse_stack_resource(
+    "{\"number\":9,\"pull_requests\":[{\"number\":7,\"merged_at\":null}]}",
+  )?
+  assert stack.number == 9
+  assert stack.pull_requests.length() == 1
+  assert !stack.pull_requests[0].merged
+  Ok(())
+}

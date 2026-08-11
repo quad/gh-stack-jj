@@ -1,0 +1,118 @@
+import "go:context"
+import "go:strings"
+
+#[test]
+fn gh_api_uses_enterprise_host() {
+  let config = Config {
+    repo: Repository.new("ghe.example/acme/project"),
+    runner: exec_command,
+    ..,
+  }
+  let args = gh_api(config, "repos/acme/project/stacks")
+    .args(["--paginate"])
+    .build()
+  assert args.equals([
+    "api",
+    "--hostname",
+    "ghe.example",
+    "repos/acme/project/stacks",
+    "--paginate",
+  ])
+}
+
+#[test]
+fn parses_repository_urls() {
+  let repo = Repository.new("github.example/acme/project")
+  assert repo.host == "github.example"
+  assert repo.path == "acme/project"
+  assert Repository.new("acme/project").host == "github.com"
+  assert Repository.new("/acme/project/").name == "acme/project"
+}
+
+#[test]
+fn builds_pull_request_urls() {
+  let config = Config {
+    repo: Repository.new("acme/project"),
+    runner: exec_command,
+    ..,
+  }
+  assert pull_request_url(config, 7) == "https://github.com/acme/project/pull/7"
+}
+
+#[test]
+fn read_stack_reports_read_context() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["ERR:server unavailable"], .. }
+  let assert Err(err) = read_stack(
+    Config { repo: Repository.new("example/repo"), ..fake_config(&runner) },
+    context.Background(),
+    7,
+  )
+  assert strings.Contains(err.Error(), "read Stack #7")
+  Ok(())
+}
+
+#[test]
+fn create_stack_reads_number() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["{\"number\":9}"], .. }
+  let number = create_stack(fake_config(&runner), context.Background(), [7])?
+  assert number == 9
+  Ok(())
+}
+
+#[test]
+fn find_pr_retains_merged_history() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":7,\"baseRefName\":\"main\",\"headRefName\":\"layer\",\"state\":\"closed\",\"mergedAt\":\"2026-08-01T00:00:00Z\",\"url\":\"\",\"stack\":9}]",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  let assert Some(value) = find_pr(config, context.Background(), "layer")?
+  assert value.number == 7
+  assert value.stack == Some(9)
+  Ok(())
+}
+
+#[test]
+fn find_pr_rejects_multiple_open_matches() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":1,\"baseRefName\":\"main\",\"headRefName\":\"layer\",\"state\":\"OPEN\"},{\"number\":2,\"baseRefName\":\"main\",\"headRefName\":\"layer\",\"state\":\"OPEN\"}]",
+    ],
+    ..,
+  }
+  let config = fake_config(&runner)
+  let assert Err(err) = find_pr(config, context.Background(), "layer")
+  assert strings.Contains(err.Error(), "multiple open pull requests")
+  Ok(())
+}
+
+#[test]
+fn find_pr_rejects_invalid_pull_request_number() -> Result<(), error> {
+  let mut runner = FakeRunner {
+    outputs: [
+      "[{\"number\":0,\"baseRefName\":\"main\",\"headRefName\":\"layer\",\"state\":\"OPEN\"}]",
+    ],
+    ..,
+  }
+  let assert Err(err) = find_pr(
+    fake_config(&runner),
+    context.Background(),
+    "layer",
+  )
+  assert strings.Contains(err.Error(), "invalid pull request")
+  Ok(())
+}
+
+#[test]
+fn find_pr_reports_bad_json() -> Result<(), error> {
+  let mut runner = FakeRunner { outputs: ["not json"], .. }
+  let assert Err(err) = find_pr(
+    fake_config(&runner),
+    context.Background(),
+    "layer",
+  )
+  assert strings.Contains(err.Error(), "parse GitHub pull request output")
+  Ok(())
+}

@@ -1,0 +1,39 @@
+import "go:context"
+import "go:errors"
+import "go:strings"
+
+struct FakeRunner { outputs: Slice<string>, calls: Slice<string>, index: int }
+
+impl FakeRunner {
+  fn run(
+    self: Ref<FakeRunner>,
+    ctx: context.Context,
+    name: string,
+    args: Slice<string>,
+  ) -> Result<string, error> {
+    let _ = ctx
+    let command = name + " " + args.join(" ")
+    self.calls = self.calls.append(command)
+    if self.index >= self.outputs.length() {
+      return Err(errors.New(f"unexpected command: {command}"))
+    }
+    let output = self.outputs[self.index]
+    self.index += 1
+    if strings.HasPrefix(output, "ERR:") {
+      return Err(errors.New(output.substring(4..)))
+    }
+    Ok(output)
+  }
+}
+
+fn fake_config(runner: Ref<FakeRunner>) -> Config {
+  Config { remote: "origin", runner: fake_runner(runner), .. }
+}
+
+fn fake_runner(runner: Ref<FakeRunner>) -> Runner {
+  |ctx, name, args| runner.run(ctx, name, args)
+}
+
+fn has_call(runner: FakeRunner, value: string) -> bool {
+  runner.calls.any(|call| strings.Contains(call, value))
+}

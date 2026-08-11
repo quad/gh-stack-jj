@@ -29,14 +29,6 @@ gh stack-jj
 
 (By default, it uses the nearest bookmark reachable from `@`; use `--bookmark NAME` to override it.) Fetch first when the remote-tracking bookmarks are out of date.
 
-The command uses GitHub's [Stack API](https://github.com/github/gh-stack) when the stack has at least two pull requests. GitHub CLI authentication is used for all pull-request and stack operations.
+## License
 
-## Development
-
-The Go toolchain is pinned in `mise.toml`:
-
-```sh
-mise build
-```
-
-This formats, tests, vets, and builds the binary.
+Vibecoded: CC0 1.0 Universal.

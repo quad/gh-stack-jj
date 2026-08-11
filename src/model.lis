@@ -1,0 +1,32 @@
+struct Layer { head: string, title: string }
+
+struct StackPR { number: int, merged: bool }
+
+struct StackResource { number: int, pull_requests: Slice<StackPR> }
+
+enum Plan {
+  Noop,
+  Append(Slice<int>),
+  Restack(Slice<int>),
+}
+
+fn is_prefix(prefix: Slice<int>, values: Slice<int>) -> bool {
+  if prefix.length() > values.length() { return false }
+  prefix.equals(values[..prefix.length()])
+}
+
+impl StackResource {
+  fn plan(self, desired: Slice<int>) -> Plan {
+    let existing = self.pull_requests
+      .filter(|pr| !pr.merged || desired.contains(pr.number))
+      .map(|pr| pr.number)
+    if existing.equals(desired) { return Plan.Noop }
+    if is_prefix(existing, desired) {
+      return Plan.Append(desired[existing.length()..])
+    }
+    let removed = self.pull_requests
+      .filter(|pr| !desired.contains(pr.number))
+      .map(|pr| pr.number)
+    Plan.Restack(removed)
+  }
+}

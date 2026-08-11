@@ -1,0 +1,180 @@
+import "go:context"
+import "go:encoding/json"
+import "go:errors"
+import "go:fmt"
+import "go:strconv"
+import "go:strings"
+
+#[json(snake_case)]
+struct StackNumberResponse { number: int }
+
+fn gh_args(config: Config, command: Slice<string>) -> Args {
+  Args.new(command).option("--repo", config.repo.name)
+}
+
+fn gh_api(config: Config, endpoint: string) -> Args {
+  Args
+    .new(["api"])
+    .when(config.repo.host != "github.com", ["--hostname", config.repo.host])
+    .arg(endpoint)
+}
+
+fn gh_repo_api(config: Config, path: string) -> Args {
+  gh_api(config, f"repos/{config.repo.path}/{path}")
+}
+
+fn default_branch(config: Config, ctx: context.Context) -> Result<string, error> {
+  let output = run_gh(
+    config,
+    ctx,
+    gh_args(config, [
+      "repo",
+      "view",
+      "--json",
+      "defaultBranchRef",
+      "--jq",
+      ".defaultBranchRef.name",
+    ]),
+  )?
+  let branch = strings.TrimSpace(output)
+  if branch == "" {
+    return Err(errors.New("GitHub repository has no default branch"))
+  }
+  Ok(branch)
+}
+
+fn find_pr(config: Config, ctx: context.Context, head: string) -> Result<Option<PullRequest>, error> {
+  let owner = strings.Split(config.repo.path, "/")[0]
+  let args = gh_repo_api(config, "pulls")
+    .option("--method", "GET")
+    .option("--field", "state=all")
+    .option("--field", f"head={owner}:{head}")
+    .option("--field", "per_page=2")
+    .option(
+      "--jq",
+      "[.[] | {number, baseRefName: .base.ref, headRefName: .head.ref, state, mergedAt: .merged_at, url: .html_url, stack: .stack.number}]",
+    )
+  let mut prs: Slice<PullRequest> = []
+  json
+    .Unmarshal(run_gh(config, ctx, args)? as Slice<byte>, &prs)
+    .wrap_err("parse GitHub pull request output")?
+  if prs.is_empty() { return Ok(None) }
+  if !prs.all(|pr| pr.number > 0 && pr.head_ref_name == head) {
+    return Err(fmt.Errorf(
+      "GitHub returned invalid pull request for head %q",
+      head,
+    ))
+  }
+  let open = prs.filter(|pr| pr.is_open())
+  match open.length() {
+    0 => (),
+    1 => return Ok(open.get(0)),
+    _ => {
+      return Err(fmt.Errorf(
+        "multiple open pull requests found for head %q",
+        head,
+      ))
+    },
+  }
+  if prs.length() > 1 {
+    return Err(fmt.Errorf(
+      "multiple historical pull requests found for head %q",
+      head,
+    ))
+  }
+  let Some(_) = prs[0].merged_at else {
+    return Err(fmt.Errorf(
+      "pull request #%d for head %q is closed without merging; reopen it or remove the bookmark",
+      prs[0].number,
+      head,
+    ))
+  }
+  Ok(Some(prs[0]))
+}
+
+fn create_pr(
+  config: Config,
+  ctx: context.Context,
+  head: string,
+  base: string,
+  title: string,
+) -> Result<(), error> {
+  let args = gh_args(config, [
+    "pr",
+    "create",
+    "--base",
+    base,
+    "--head",
+    head,
+    "--title",
+    title,
+    "--body",
+    "",
+  ])
+  let args = args.when(config.draft, ["--draft"])
+  let _ = run_gh(config, ctx, args)?
+  Ok(())
+}
+
+fn edit_base(config: Config, ctx: context.Context, number: int, base: string) -> Result<(), error> {
+  let _ = run_gh(
+    config,
+    ctx,
+    gh_args(config, ["pr", "edit", strconv.Itoa(number), "--base", base]),
+  )?
+  Ok(())
+}
+
+fn pull_request_url(config: Config, number: int) -> string {
+  f"https://{config.repo.host}/{config.repo.path}/pull/{number}"
+}
+
+fn read_stack(config: Config, ctx: context.Context, number: int) -> Result<StackResource, error> {
+  let output = run_gh(config, ctx, gh_repo_api(config, f"stacks/{number}")).wrap_err(
+    f"read Stack #{number}",
+  )?
+  parse_stack_resource(output).wrap_err(f"parse Stack #{number}")
+}
+
+fn stack_post_args(config: Config, path: string, numbers: Slice<int>) -> Args {
+  numbers.fold(
+    gh_repo_api(config, path).option("--method", "POST"),
+    |args, number| args.option("--field", f"pull_requests[]={number}"),
+  )
+}
+
+fn extend_stack(
+  config: Config,
+  ctx: context.Context,
+  stack_number: int,
+  numbers: Slice<int>,
+) -> Result<(), error> {
+  let args = stack_post_args(config, f"stacks/{stack_number}/add", numbers)
+  let _ = run_gh(config, ctx, args).wrap_err(f"extend Stack #{stack_number}")?
+  Ok(())
+}
+
+fn create_stack(config: Config, ctx: context.Context, numbers: Slice<int>) -> Result<int, error> {
+  let args = stack_post_args(config, "stacks", numbers)
+  let output = run_gh(config, ctx, args).wrap_err("create Stack")?
+  let mut response = StackNumberResponse { number: 0 }
+  json
+    .Unmarshal(output as Slice<byte>, &response)
+    .wrap_err("parse created Stack")?
+  let number = response.number
+  if number <= 0 {
+    return Err(errors.New("Stack response did not include a valid number"))
+  }
+  Ok(number)
+}
+
+fn clear_stack(config: Config, ctx: context.Context, number: int) -> Result<(), error> {
+  let _ = run_gh(
+      config,
+      ctx,
+      gh_repo_api(config, f"stacks/{number}/unstack").option("--method", "POST"),
+    ).wrap_err(
+    f"clear Stack #{number} before restructuring",
+  )?
+  Ok(())
+}

@@ -1,0 +1,220 @@
+import "go:context"
+import "go:errors"
+import "go:fmt"
+import "go:net/url"
+import "go:slices"
+import "go:strconv"
+import "go:strings"
+
+fn decode_bookmarks(input: string) -> Result<Slice<JJBookmark>, error> {
+  let records: Slice<Slice<JJBookmark>> = decode_stream(
+    input,
+    Slice.new<JJBookmark>(),
+  )?
+  Ok(slices.Concat(records...))
+}
+
+fn decode_layers(input: string) -> Result<Slice<JJLayer>, error> {
+  decode_stream(
+    input,
+    JJLayer { local_bookmarks: [], remote_bookmarks: [], .. },
+  )
+}
+
+fn bookmark_names(bookmarks: Slice<JJBookmark>) -> Slice<string> {
+  let names = bookmarks
+    .filter(|bookmark| bookmark.name != "")
+    .map(|bookmark| bookmark.name)
+  slices.Sorted(slices.Values(names))
+}
+
+fn current_bookmark(config: Config, ctx: context.Context) -> Result<string, error> {
+  let output = run_jj(config, ctx, [
+    "log",
+    "--no-graph",
+    "--revision",
+    "heads(bookmarks() & ::@)",
+    "--template",
+    "json(local_bookmarks)",
+  ])?
+  let bookmarks = decode_bookmarks(output).wrap_err(
+    "parse current jj bookmark output",
+  )?
+  let names = bookmarks.map(|bookmark| bookmark.name)
+  if names.is_empty() || names[0] == "" {
+    return Err(errors.New("current jj revision is not on a bookmark"))
+  }
+  if names.length() > 1 {
+    let joined = names.join(", ")
+    return Err(errors.New(
+      f"current jj revision has multiple bookmarks: {joined}",
+    ))
+  }
+  Ok(names[0])
+}
+
+fn trunk_branch(config: Config, ctx: context.Context) -> Result<string, error> {
+  let output = run_jj(config, ctx, [
+    "log",
+    "--no-graph",
+    "--revision",
+    "trunk()",
+    "--template",
+    f"json(remote_bookmarks.filter(|b| b.remote() == {strconv.Quote(config.remote)}))",
+  ])?
+  let bookmarks = decode_bookmarks(output).wrap_err(
+    "parse jj trunk() bookmark output",
+  )?
+  let branches = bookmark_names(bookmarks)
+  if branches.length() > 1 {
+    let joined = branches.join(", ")
+    return Err(errors.New(
+      f"jj trunk() has multiple {config.remote} bookmarks: {joined}",
+    ))
+  }
+  if branches.length() == 1 { return Ok(branches[0]) }
+  Ok("")
+}
+
+fn remote_repo(config: Config, ctx: context.Context) -> Result<Repository, error> {
+  let template = f"json(git_web_url({strconv.Quote(config.remote)}))"
+  let output = run_jj(config, ctx, [
+    "log",
+    "--no-graph",
+    "--revision",
+    "@",
+    "--template",
+    template,
+  ])?
+  let remote_url = decode_string(output).wrap_err("parse jj remote URL output")?
+  if remote_url == "" { return Err(errors.New("jj returned no web URL")) }
+  let parsed = url.Parse(remote_url)?
+  if parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+    return Err(fmt.Errorf("unsupported remote URL %q", remote_url))
+  }
+  let path = parsed.Path
+    |> strings.Trim("/")
+    |> strings.TrimSuffix(".git")
+  let parts = path |> strings.Split("/")
+  if parts.length() != 2 || parts[0] == "" || parts[1] == "" {
+    return Err(fmt.Errorf(
+      "remote URL %q does not contain OWNER/REPO",
+      remote_url,
+    ))
+  }
+  let path = f"{parts[0]}/{parts[1]}"
+  let name = if parsed.Host == "github.com" {
+    path
+  } else {
+    f"{parsed.Host}/{path}"
+  }
+  Ok(Repository.new(name))
+}
+
+fn resolve(config: Config, ctx: context.Context, revset: string) -> Result<string, error> {
+  let output = run_jj(config, ctx, [
+    "log",
+    "--no-graph",
+    "--revision",
+    f"exactly({revset}, 1)",
+    "--template",
+    "json(commit_id)",
+  ])?
+  decode_string(output).wrap_err(f"parse revision {revset}")
+}
+
+fn remote_bookmark_revset(name: string, remote: string) -> string {
+  f"remote_bookmarks(exact:{strconv.Quote(name)}, remote=exact:{strconv.Quote(remote)})"
+}
+
+fn selected_remote_revset(remote: string) -> string {
+  f"remote_bookmarks(remote=exact:{strconv.Quote(remote)})"
+}
+
+fn layer_range_revset(target: Target) -> string {
+  let base = commit_revset(target.base_commit)
+  let tip = commit_revset(target.tip)
+  f"exactly(fork_point({base} | {tip}), 1)..{tip}"
+}
+
+fn commit_revset(id: string) -> string {
+  f"commit_id({strconv.Quote(id)})"
+}
+
+fn compact_names(names: Slice<string>) -> Slice<string> {
+  slices.Compact(slices.Sorted(slices.Values(names)))
+}
+
+fn load_layers(config: Config, ctx: context.Context, target: Target) -> Result<Slice<Layer>, error> {
+  let range_revset = layer_range_revset(target)
+  let selected_remote = selected_remote_revset(config.remote)
+  let layer_revset = f"{selected_remote} & {range_revset}"
+  let selected_local = f"bookmarks(exact:{strconv.Quote(target.bookmark)})"
+  let revset = f"((bookmarks() | {selected_remote}) & {range_revset}) | {selected_local}"
+  let head_revset = f"heads({layer_revset})"
+  let remote_template = f"remote_bookmarks.filter(|b| b.remote() == {strconv.Quote(config.remote)})"
+  let template = f"concat('{{ \"id\": ', json(commit_id), ', \"local_bookmarks\": ', json(local_bookmarks), ', \"remote_bookmarks\": ', json({remote_template}), ', \"is_head\": ', json(self.contained_in({strconv.Quote(head_revset)})), ', \"title\": ', json(description.first_line()), ' }}')"
+  let output = run_jj(config, ctx, [
+    "log",
+    "--no-graph",
+    "--reversed",
+    "--revision",
+    revset,
+    "--template",
+    template,
+  ])?
+  let records = decode_layers(output).wrap_err("parse jj layer output")?
+  let mut unpushed: Slice<string> = []
+  let mut remote_records: Slice<JJLayer> = []
+  let mut layer_heads: Slice<string> = []
+  for record in records {
+    if record.id == "" {
+      return Err(errors.New("jj returned a layer without a commit ID"))
+    }
+    let local = bookmark_names(record.local_bookmarks)
+    let remote = bookmark_names(record.remote_bookmarks)
+    if remote.is_empty() {
+      if local.is_empty() {
+        return Err(fmt.Errorf(
+          "commit %s has neither local nor %s remote bookmarks",
+          record.id,
+          config.remote,
+        ))
+      }
+      unpushed = unpushed.append(local...)
+    } else {
+      if record.is_head { layer_heads = layer_heads.append(record.id) }
+      remote_records = remote_records.append(record)
+    }
+  }
+  let unpushed = compact_names(unpushed)
+  if !unpushed.is_empty() {
+    let names = unpushed.join(", ")
+    return Err(errors.New(f"bookmarks not pushed to {config.remote}: {names}"))
+  }
+  if !remote_records.is_empty() && layer_heads.length() != 1 {
+    let mut previous = ""
+    for record in remote_records {
+      if layer_heads.contains(record.id) && previous != "" {
+        return Err(errors.New(f"check {previous} before {record.id}"))
+      }
+      previous = record.id
+    }
+    return Err(errors.New("pushed bookmarks are not a linear stack"))
+  }
+  let mut layers: Slice<Layer> = []
+  for record in remote_records {
+    let heads = bookmark_names(record.remote_bookmarks)
+    if heads.length() != 1 {
+      return Err(errors.New(
+        f"commit {record.id} has {heads.length()} {config.remote} remote bookmarks, want one",
+      ))
+    }
+    let title = strings.TrimSpace(record.title)
+    if title == "" {
+      return Err(fmt.Errorf("bookmark %q has no description", heads[0]))
+    }
+    layers = layers.append(Layer { head: heads[0], title })
+  }
+  Ok(layers)
+}
