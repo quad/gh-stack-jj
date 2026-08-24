@@ -1,5 +1,4 @@
 [tools]
-goreleaser = "latest"
 lisette = "0.11.2"
 
 [tasks.build]
