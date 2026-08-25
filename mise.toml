@@ -1,4 +1,5 @@
 [tools]
+goreleaser = "2.17.1"
 lisette = "0.11.2"
 
 [tasks.build]
@@ -9,3 +10,7 @@ run = [
   "lis test",
   "lis build",
 ]
+
+[tasks.release]
+description = "Release to Github"
+run = "goreleaser release"

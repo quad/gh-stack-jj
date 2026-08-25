@@ -1,9 +1,5 @@
 version: 2
 
-before:
-  hooks:
-    - mise build
-
 builds:
   - dir: ./target
     env:
@@ -14,6 +10,10 @@ builds:
     goarch:
       - arm64
       - amd64
+
+archives:
+  - formats: ["binary"]
+    name_template: "{{ .Os }}-{{ .Arch }}"
 
 release:
   github:
